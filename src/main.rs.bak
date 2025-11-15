@@ -1,0 +1,366 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // hide console window on Windows in release
+#![allow(rustdoc::missing_crate_level_docs)] // it's an example
+
+use eframe::egui;
+use serde::{Deserialize, Serialize};
+use std::fs;
+
+#[derive(Debug, Deserialize, Serialize)]
+struct AppConfig {
+    app_title: String,
+    quiz_path: String,
+    window_width: f32,
+    window_height: f32,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            app_title: "Quiz App".to_string(),
+            quiz_path: "Quizzes/quiz1.txt".to_string(),
+            window_width: 400.0,
+            window_height: 300.0,
+        }
+    }
+}
+
+fn load_config() -> AppConfig {
+    let content = fs::read_to_string("Config.yaml").unwrap_or_else(|_| {
+        r#"app_title: "Quiz App"
+quiz_path: "Quizzes/quiz1.txt"
+window_width: 400.0
+window_height: 300.0
+"#.to_string()
+    });
+    
+    serde_yaml::from_str(&content).unwrap_or_else(|_| AppConfig::default())
+}
+
+fn main() -> eframe::Result {
+    env_logger::init(); // Log to stderr (if you run with `RUST_LOG=debug`).
+    let config = load_config();
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([config.window_width, config.window_height]),
+        ..Default::default()
+    };
+    let app_title = config.app_title.clone();
+    let quiz_path = config.quiz_path.clone();
+    eframe::run_native(
+        &app_title,
+        options,
+        Box::new(|cc| {
+            egui_extras::install_image_loaders(&cc.egui_ctx);
+            
+            let mut fonts = egui::FontDefinitions::default();
+            
+            let font_paths = vec![
+                "./fonts/MPLUSRounded1c-Regular.ttf",
+                "./fonts/NotoSansSymbols2-Regular.ttf",
+            ];
+            
+            for font_path in font_paths {
+                if let Ok(buf) = fs::read(font_path) {
+                    let font_name = "system_font".to_owned();
+                    fonts.font_data.insert(
+                        font_name.clone(),
+                        std::sync::Arc::new(egui::FontData::from_owned(buf)),
+                    );
+                    fonts.families
+                        .entry(egui::FontFamily::Proportional)
+                        .or_default()
+                        .insert(0, font_name.clone());
+                    fonts.families
+                        .entry(egui::FontFamily::Monospace)
+                        .or_default()
+                        .insert(0, font_name);
+                    break;
+                }
+            }
+            
+            cc.egui_ctx.set_fonts(fonts);
+            
+            Ok(Box::new(MyApp::new(&quiz_path)))
+        }),
+    )
+}
+
+struct MyApp {
+    questions: Vec<Quiz>,
+    current_question_index: usize,
+    selected_answer: Option<usize>,
+    user_answers: Vec<Option<String>>,
+    show_results: bool,
+    quiz_path: String,
+    quiz_files: Vec<String>,
+    show_quiz_selection: bool,
+    quizzes_dir: String,
+}
+
+impl MyApp {
+    fn new(quiz_path: &str) -> Self {
+        let quizzes_dir = std::path::Path::new(quiz_path)
+            .parent()
+            .and_then(|p| p.to_str())
+            .unwrap_or("Quizzes")
+            .to_string();
+        
+        let quiz_files = Self::load_quiz_list(&quizzes_dir);
+        let show_quiz_selection = quiz_files.len() > 1;
+        
+        let questions = if show_quiz_selection {
+            Vec::new()
+        } else {
+            load_quizzes(quiz_path)
+        };
+        
+        let user_answers = vec![None; questions.len()];
+        Self {
+            questions,
+            current_question_index: 0,
+            selected_answer: None,
+            user_answers,
+            show_results: false,
+            quiz_path: quiz_path.to_string(),
+            quiz_files,
+            show_quiz_selection,
+            quizzes_dir,
+        }
+    }
+    
+    fn load_quiz_list(dir: &str) -> Vec<String> {
+        let mut quiz_files = Vec::new();
+        if let Ok(entries) = fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                if let Ok(file_type) = entry.file_type() {
+                    if file_type.is_file() {
+                        if let Some(name) = entry.file_name().to_str() {
+                            if name.ends_with(".txt") || name.ends_with(".yaml") {
+                                quiz_files.push(name.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        quiz_files.sort();
+        quiz_files
+    }
+    
+    fn load_selected_quiz(&mut self, filename: &str) {
+        let path = format!("{}/{}", self.quizzes_dir, filename);
+        self.questions = load_quizzes(&path);
+        self.user_answers = vec![None; self.questions.len()];
+        self.current_question_index = 0;
+        self.selected_answer = None;
+        self.show_results = false;
+        self.show_quiz_selection = false;
+        self.quiz_path = path;
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+struct Answer {
+    letter: String,
+    text: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+struct Quiz {
+    question: String,
+    answers: Vec<Answer>,
+    correct_answer: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct QuizFile {
+    questions: Vec<Quiz>,
+}
+
+fn load_quizzes(path: &str) -> Vec<Quiz> {
+    let content = fs::read_to_string(path).unwrap_or_else(|_| {
+        r#"questions:
+  - question: "Question par défaut ?"
+    answers:
+      - letter: A
+        text: "Réponse A"
+      - letter: B
+        text: "Réponse B"
+      - letter: C
+        text: "Réponse C"
+      - letter: D
+        text: "Réponse D"
+"#.to_string()
+    });
+    
+    let quiz_file: QuizFile = serde_yaml::from_str(&content).unwrap_or_else(|_| {
+        QuizFile {
+            questions: vec![Quiz {
+                question: "Question par défaut ?".to_string(),
+                answers: vec![
+                    Answer { letter: "A".to_string(), text: "Réponse A".to_string() },
+                    Answer { letter: "B".to_string(), text: "Réponse B".to_string() },
+                    Answer { letter: "C".to_string(), text: "Réponse C".to_string() },
+                    Answer { letter: "D".to_string(), text: "Réponse D".to_string() },
+                ],
+                correct_answer: "A".to_string(),
+            }],
+        }
+    });
+    
+    quiz_file.questions
+}
+
+impl eframe::App for MyApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            if self.show_quiz_selection {
+                self.show_quiz_selection_screen(ui);
+            } else if self.show_results {
+                self.show_results_screen(ui);
+            } else {
+                self.show_quiz_screen(ui);
+            }
+        });
+    }
+}
+
+impl MyApp {
+    fn show_quiz_screen(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Quiz");
+        ui.add_space(10.0);
+        
+        // Affichage du numéro de question
+        ui.label(format!("Question {}/{}", self.current_question_index + 1, self.questions.len()));
+        ui.add_space(20.0);
+        
+        if let Some(current_quiz) = self.questions.get(self.current_question_index) {
+            ui.label(&current_quiz.question);
+            ui.add_space(15.0);
+            
+            // Restaurer la réponse précédemment sélectionnée
+            if self.selected_answer.is_none() {
+                if let Some(Some(saved_letter)) = self.user_answers.get(self.current_question_index) {
+                    for (i, answer) in current_quiz.answers.iter().enumerate() {
+                        if &answer.letter == saved_letter {
+                            self.selected_answer = Some(i);
+                            break;
+                        }
+                    }
+                }
+            }
+            
+            for (i, answer) in current_quiz.answers.iter().enumerate() {
+                if ui.selectable_label(
+                    self.selected_answer == Some(i),
+                    format!("{}) {}", answer.letter, answer.text)
+                ).clicked() {
+                    self.selected_answer = Some(i);
+                    // Enregistrer la réponse
+                    self.user_answers[self.current_question_index] = Some(answer.letter.clone());
+                }
+            }
+            
+            ui.add_space(20.0);
+            
+            if let Some(answer_idx) = self.selected_answer {
+                ui.label(format!("Vous avez sélectionné: {}", current_quiz.answers[answer_idx].letter));
+            }
+            
+            ui.add_space(20.0);
+            
+            // Boutons de navigation
+            ui.horizontal(|ui| {
+                if self.current_question_index > 0 {
+                    if ui.button("◀ Précédent").clicked() {
+                        self.current_question_index -= 1;
+                        self.selected_answer = None;
+                    }
+                }
+                
+                if self.current_question_index < self.questions.len() - 1 {
+                    if ui.button("Suivant ▶").clicked() {
+                        self.current_question_index += 1;
+                        self.selected_answer = None;
+                    }
+                } else {
+                    if ui.button("Terminer").clicked() {
+                        self.show_results = true;
+                    }
+                }
+            });
+        }
+    }
+    
+    fn show_results_screen(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Résultats du Quiz");
+        ui.add_space(20.0);
+        
+        let mut correct_count = 0;
+        let total = self.questions.len();
+        
+        for (i, quiz) in self.questions.iter().enumerate() {
+            if let Some(Some(user_answer)) = self.user_answers.get(i) {
+                if user_answer == &quiz.correct_answer {
+                    correct_count += 1;
+                }
+            }
+        }
+        
+        ui.label(format!("Score: {}/{}", correct_count, total));
+        ui.label(format!("Pourcentage: {:.1}%", (correct_count as f32 / total as f32) * 100.0));
+        ui.add_space(30.0);
+        
+        ui.label("Détails:");
+        ui.add_space(10.0);
+        
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            for (i, quiz) in self.questions.iter().enumerate() {
+                let user_answer = self.user_answers.get(i).and_then(|a| a.as_ref());
+                let is_correct = user_answer.map_or(false, |a| a == &quiz.correct_answer);
+                
+                ui.horizontal(|ui| {
+                    ui.label(format!("Q{}: ", i + 1));
+                    if is_correct {
+                        ui.colored_label(egui::Color32::GREEN, "[✓] Correct");
+                    } else {
+                        ui.colored_label(egui::Color32::RED, "[✗] Incorrect");
+                        if let Some(ans) = user_answer {
+                            ui.label(format!("(Votre réponse: {}, Correcte: {})", ans, quiz.correct_answer));
+                        } else {
+                            ui.label(format!("(Non répondu, Correcte: {})", quiz.correct_answer));
+                        }
+                    }
+                });
+                ui.add_space(5.0);
+            }
+        });
+        
+        ui.add_space(20.0);
+        
+        if self.quiz_files.len() > 1 {
+            if ui.button("Choisir un autre quiz").clicked() {
+                self.show_quiz_selection = true;
+                self.show_results = false;
+            }
+        }
+    }
+    
+    fn show_quiz_selection_screen(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Sélection du Quiz");
+        ui.add_space(20.0);
+        
+        ui.label("Choisissez un quiz :");
+        ui.add_space(15.0);
+        
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            for quiz_file in &self.quiz_files.clone() {
+                let display_name = quiz_file.trim_end_matches(".txt").trim_end_matches(".yaml");
+                if ui.button(display_name).clicked() {
+                    self.load_selected_quiz(quiz_file);
+                }
+                ui.add_space(5.0);
+            }
+        });
+    }
+}
